@@ -1,4 +1,4 @@
 # CHANGEME: Set these variable to your liking
-title: ESPHome Project Template
-description: Powered by ESPHome and ESP Web Tools
+title: KC868-A16 OI-6950 Modbus Bridge
+description: ESP32-based Modbus RTU bridge for OI-6950 gas monitors – powered by ESPHome
 theme: jekyll-theme-slate

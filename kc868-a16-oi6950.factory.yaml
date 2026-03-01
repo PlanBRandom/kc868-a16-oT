@@ -1,0 +1,35 @@
+packages:
+  # Include all core configuration from the main YAML.
+  core: !include kc868-a16-oi6950.yaml
+
+esphome:
+  # Project identification used by the ESPHome dashboard and OTA update checks.
+  project:
+    name: planbr.kc868-a16-oi6950
+    version: dev  # Replaced by the GitHub release tag during the publish workflow.
+
+# Public URL of the core YAML file used when a device is adopted from the
+# ESP Web Tools installer page.
+dashboard_import:
+  package_import_url: github://PlanBRandom/kc868-a16-oT/kc868-a16-oi6950.yaml@main
+
+# Bluetooth LE provisioning – lets the user send Wi-Fi credentials via the
+# Home Assistant companion app without pressing any buttons.
+esp32_improv:
+  authorizer: none
+
+# Serial provisioning over USB-C – convenient when flashing for the first time.
+improv_serial:
+
+# HTTP client required for OTA updates pulled from GitHub releases.
+http_request:
+
+ota:
+  - platform: http_request
+    id: ota_http_request
+
+update:
+  - platform: http_request
+    name: None
+    id: update_http_request
+    source: https://github.com/PlanBRandom/kc868-a16-oT/releases/latest/download/kc868-a16-oi6950.manifest.json
