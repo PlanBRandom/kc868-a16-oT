@@ -1,0 +1,21 @@
+packages:
+  # Include the full gecko-habitat configuration
+  core: !include kc868-a16-gecko-habitat.yaml
+
+esphome:
+  # Project identification – used by ESPHome dashboard adoption
+  project:
+    name: planbRandom.gecko-habitat
+    version: dev  # replaced by the release workflow with the tag version
+
+# This points to the core YAML so that once a device is adopted by the
+# ESPHome dashboard it pulls the runtime config without the factory extras.
+dashboard_import:
+  package_import_url: github://PlanBRandom/kc868-a16-oT/kc868-a16-gecko-habitat.yaml@main
+
+# Bluetooth LE Wi-Fi provisioning (ESP32 only)
+esp32_improv:
+  authorizer: none
+
+# USB serial Wi-Fi provisioning
+improv_serial:
