@@ -66,11 +66,11 @@ prometheus:
 
 # InfluxDB integration for persistent telemetry database storage.
 # Add the following entries to your secrets.yaml:
-#   influxdb_host: "192.168.1.x"   # InfluxDB server IP or hostname
-#   influxdb_port: "8086"           # default InfluxDB HTTP port
+#   influxdb_host: "192.168.1.x"    # InfluxDB server IP or hostname
+#   influxdb_port: 8086             # default InfluxDB HTTP port (numeric)
 #   influxdb_database: "esphome"    # target database name
-#   influxdb_username: "esphome"    # InfluxDB user (leave blank to omit)
-#   influxdb_password: "changeme"   # InfluxDB password (leave blank to omit)
+#   influxdb_username: "esphome"    # InfluxDB user (required; empty string is still sent)
+#   influxdb_password: "changeme"   # InfluxDB password (required; empty string is still sent)
 influxdb:
   host: !secret influxdb_host
   port: !secret influxdb_port
