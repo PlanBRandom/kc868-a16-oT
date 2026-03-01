@@ -1,0 +1,778 @@
+# ESPHome Configuration: KC868-A16 + OI-6950 Modbus Bridge
+#
+# Reads gas-concentration data from an OI-6950 gas monitor via RS485 Modbus RTU
+# and exposes it to Home Assistant through the native API, MQTT auto-discovery,
+# and a Bluetooth proxy.  Each of the 16 relay/MOSFET outputs is automatically
+# activated when its paired gas channel exceeds the alarm threshold.
+#
+# Hardware: KinCony KC868-A16 (ESP32, LAN8720 Ethernet, RS485, 16×I + 16×O via PCF8574)
+# Device:   OI-6950 gas monitor / repeater (Modbus RTU slave, 9600 8N1)
+#
+# Register sources:
+#   - Channel gas readings: PlanBRandom/teleproject – teleprogject32.yaml
+#     (validated with OI-7530/7010; address = 0x21 + (channel-1)×2)
+#   - System registers: PlanBRandom/anjoytell – MODBUS_DOCUMENTATION.md
+#     (supply voltage 6052-6053, firmware 9900-9901, fault LED 6012)
+
+substitutions:
+  device_name: kc868-a16-oi6950
+  friendly_name: "KC868-A16 OI-6950"
+  # OI-6950 Modbus slave address (register 6000 on the device, default = 1).
+  # Change per-unit when multiple devices share one RS485 bus.
+  modbus_address: "0x01"
+  # How often to poll the OI-6950 (matches the teleproject default).
+  modbus_update_interval: "5s"
+  # Gas concentration (ppm) at or above which a relay output is activated.
+  gas_alarm_threshold: "10.0"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  # Appends the last 3 octets of the MAC address so each of the 30 units
+  # gets a unique device name from a single firmware image.
+  name_add_mac_suffix: true
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Disable serial logger so the hardware UART is available for Modbus RS485.
+logger:
+  level: INFO
+  baud_rate: 0
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# ─── Networking ───────────────────────────────────────────────────────────────
+
+# KC868-A16 primary network: LAN8720 Ethernet (GPIO17 used as CLK_OUT).
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk:
+    pin: GPIO17
+    mode: CLK_OUT
+  phy_addr: 0
+
+# WiFi fallback access point when Ethernet is unavailable.
+wifi:
+  ap:
+
+captive_portal:
+
+# MQTT: direct publishing to the broker and Home Assistant auto-discovery.
+# Mirrors the approach used in PlanBRandom/teleproject – teleprogject32.yaml.
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  discovery: true
+  discovery_prefix: homeassistant
+
+# ─── Bluetooth Proxy ──────────────────────────────────────────────────────────
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1100ms
+    window: 1100ms
+    active: true
+
+bluetooth_proxy:
+  active: true
+
+# ─── I²C + PCF8574 I/O expanders ─────────────────────────────────────────────
+
+i2c:
+  sda: GPIO4
+  scl:
+    number: GPIO5
+    ignore_strapping_warning: true
+
+pcf8574:
+  - id: inputs_1_8
+    address: 0x22
+    pcf8575: false
+  - id: inputs_9_16
+    address: 0x21
+    pcf8575: false
+  - id: outputs_1_8
+    address: 0x24
+    pcf8575: false
+  - id: outputs_9_16
+    address: 0x25
+    pcf8575: false
+
+# ─── RS485 / Modbus ───────────────────────────────────────────────────────────
+
+# KC868-A16 RS485: TX = GPIO13, RX = GPIO16.
+# Direction control is handled by the on-board RS485 transceiver; no DE pin needed.
+uart:
+  id: mod_bus
+  tx_pin: GPIO13
+  rx_pin: GPIO16
+  baud_rate: 9600
+  stop_bits: 1
+  parity: NONE
+
+modbus:
+  id: modbus1
+  uart_id: mod_bus
+
+modbus_controller:
+  - id: oi6950
+    address: ${modbus_address}
+    modbus_id: modbus1
+    setup_priority: -10
+    update_interval: ${modbus_update_interval}
+
+# ─── Sensors ──────────────────────────────────────────────────────────────────
+
+sensor:
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 60s
+
+  # OI-6950 monitor supply voltage (holding registers 6052-6053, float32).
+  # Ref: anjoytell/MODBUS_DOCUMENTATION.md – firmware v5.1.2+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    name: "${friendly_name} Supply Voltage"
+    address: 6052
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 2
+
+  # OI-6950 gas channel readings (float32, ppm).
+  # Address = 0x21 + (channel-1) × 2  →  Ch1=0x21, Ch2=0x23, … Ch16=0x3F
+  # Each channel drives the matching KC868-A16 relay output via on_value.
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch1_gas
+    name: "${friendly_name} Channel 1 Gas"
+    address: 0x21
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y01
+            else:
+              - switch.turn_off: relay_y01
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch2_gas
+    name: "${friendly_name} Channel 2 Gas"
+    address: 0x23
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y02
+            else:
+              - switch.turn_off: relay_y02
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch3_gas
+    name: "${friendly_name} Channel 3 Gas"
+    address: 0x25
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y03
+            else:
+              - switch.turn_off: relay_y03
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch4_gas
+    name: "${friendly_name} Channel 4 Gas"
+    address: 0x27
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y04
+            else:
+              - switch.turn_off: relay_y04
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch5_gas
+    name: "${friendly_name} Channel 5 Gas"
+    address: 0x29
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y05
+            else:
+              - switch.turn_off: relay_y05
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch6_gas
+    name: "${friendly_name} Channel 6 Gas"
+    address: 0x2B
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y06
+            else:
+              - switch.turn_off: relay_y06
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch7_gas
+    name: "${friendly_name} Channel 7 Gas"
+    address: 0x2D
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y07
+            else:
+              - switch.turn_off: relay_y07
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch8_gas
+    name: "${friendly_name} Channel 8 Gas"
+    address: 0x2F
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y08
+            else:
+              - switch.turn_off: relay_y08
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch9_gas
+    name: "${friendly_name} Channel 9 Gas"
+    address: 0x31
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y09
+            else:
+              - switch.turn_off: relay_y09
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch10_gas
+    name: "${friendly_name} Channel 10 Gas"
+    address: 0x33
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y10
+            else:
+              - switch.turn_off: relay_y10
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch11_gas
+    name: "${friendly_name} Channel 11 Gas"
+    address: 0x35
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y11
+            else:
+              - switch.turn_off: relay_y11
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch12_gas
+    name: "${friendly_name} Channel 12 Gas"
+    address: 0x37
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y12
+            else:
+              - switch.turn_off: relay_y12
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch13_gas
+    name: "${friendly_name} Channel 13 Gas"
+    address: 0x39
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y13
+            else:
+              - switch.turn_off: relay_y13
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch14_gas
+    name: "${friendly_name} Channel 14 Gas"
+    address: 0x3B
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y14
+            else:
+              - switch.turn_off: relay_y14
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch15_gas
+    name: "${friendly_name} Channel 15 Gas"
+    address: 0x3D
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y15
+            else:
+              - switch.turn_off: relay_y15
+
+  - platform: modbus_controller
+    modbus_controller_id: oi6950
+    id: ch16_gas
+    name: "${friendly_name} Channel 16 Gas"
+    address: 0x3F
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= ${gas_alarm_threshold};'
+            then:
+              - switch.turn_on: relay_y16
+            else:
+              - switch.turn_off: relay_y16
+
+# ─── Text Sensors ─────────────────────────────────────────────────────────────
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP Address"
+    ssid:
+      name: "${friendly_name} Connected SSID"
+
+# ─── Binary Sensors ───────────────────────────────────────────────────────────
+
+binary_sensor:
+  - platform: status
+    name: "${friendly_name} Status"
+
+  # KC868-A16 digital inputs 1-16 (via PCF8574 expanders).
+  - platform: gpio
+    name: "${friendly_name} Input 01"
+    pin:
+      pcf8574: inputs_1_8
+      number: 0
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 02"
+    pin:
+      pcf8574: inputs_1_8
+      number: 1
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 03"
+    pin:
+      pcf8574: inputs_1_8
+      number: 2
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 04"
+    pin:
+      pcf8574: inputs_1_8
+      number: 3
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 05"
+    pin:
+      pcf8574: inputs_1_8
+      number: 4
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 06"
+    pin:
+      pcf8574: inputs_1_8
+      number: 5
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 07"
+    pin:
+      pcf8574: inputs_1_8
+      number: 6
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 08"
+    pin:
+      pcf8574: inputs_1_8
+      number: 7
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 09"
+    pin:
+      pcf8574: inputs_9_16
+      number: 0
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 10"
+    pin:
+      pcf8574: inputs_9_16
+      number: 1
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 11"
+    pin:
+      pcf8574: inputs_9_16
+      number: 2
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 12"
+    pin:
+      pcf8574: inputs_9_16
+      number: 3
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 13"
+    pin:
+      pcf8574: inputs_9_16
+      number: 4
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 14"
+    pin:
+      pcf8574: inputs_9_16
+      number: 5
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 15"
+    pin:
+      pcf8574: inputs_9_16
+      number: 6
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Input 16"
+    pin:
+      pcf8574: inputs_9_16
+      number: 7
+      mode: INPUT
+      inverted: true
+
+# ─── Switches (Relay / MOSFET Outputs) ───────────────────────────────────────
+
+switch:
+  # KC868-A16 relay/MOSFET outputs 1-16 (via PCF8574 expanders).
+  # Y01-Y16 are paired with OI-6950 gas channels 1-16; they activate automatically
+  # when a channel reading meets or exceeds gas_alarm_threshold.
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y01"
+    id: relay_y01
+    pin:
+      pcf8574: outputs_1_8
+      number: 0
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y02"
+    id: relay_y02
+    pin:
+      pcf8574: outputs_1_8
+      number: 1
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y03"
+    id: relay_y03
+    pin:
+      pcf8574: outputs_1_8
+      number: 2
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y04"
+    id: relay_y04
+    pin:
+      pcf8574: outputs_1_8
+      number: 3
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y05"
+    id: relay_y05
+    pin:
+      pcf8574: outputs_1_8
+      number: 4
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y06"
+    id: relay_y06
+    pin:
+      pcf8574: outputs_1_8
+      number: 5
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y07"
+    id: relay_y07
+    pin:
+      pcf8574: outputs_1_8
+      number: 6
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y08"
+    id: relay_y08
+    pin:
+      pcf8574: outputs_1_8
+      number: 7
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y09"
+    id: relay_y09
+    pin:
+      pcf8574: outputs_9_16
+      number: 0
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y10"
+    id: relay_y10
+    pin:
+      pcf8574: outputs_9_16
+      number: 1
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y11"
+    id: relay_y11
+    pin:
+      pcf8574: outputs_9_16
+      number: 2
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y12"
+    id: relay_y12
+    pin:
+      pcf8574: outputs_9_16
+      number: 3
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y13"
+    id: relay_y13
+    pin:
+      pcf8574: outputs_9_16
+      number: 4
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y14"
+    id: relay_y14
+    pin:
+      pcf8574: outputs_9_16
+      number: 5
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y15"
+    id: relay_y15
+    pin:
+      pcf8574: outputs_9_16
+      number: 6
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "${friendly_name} Relay Y16"
+    id: relay_y16
+    pin:
+      pcf8574: outputs_9_16
+      number: 7
+      mode: OUTPUT
+      inverted: true
+
+# ─── Buttons ──────────────────────────────────────────────────────────────────
+
+button:
+  - platform: restart
+    name: "${friendly_name} Restart"
