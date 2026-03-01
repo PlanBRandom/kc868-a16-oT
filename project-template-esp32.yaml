@@ -1,29 +1,632 @@
+# KC868-A16 Gecko Enclosure Monitor
+# 16 enclosures | OI-7530 32-ch gas detection | Bluetooth proxy | NFC/QR tagging
+#
+# Hardware: Kincony KC868-A16 (ESP32)
+#   - 16 relay outputs via PCF8575 I2C expander (address 0x24)
+#   - 16 digital inputs via PCF8575 I2C expander (address 0x22)
+#   - RS485 (UART2) for OI-7530 32-channel gas detector
+#   - Optional: PN532 NFC reader via I2C (address 0x28) for enclosure tag scanning
+#
+# Verify I2C expander addresses against your specific board revision before flashing.
+
+substitutions:
+  device_name: kc868-a16-gecko
+  friendly_name: "Gecko Monitor"
+
+  # Hardware pins - KC868-A16
+  i2c_sda: GPIO4
+  i2c_scl: GPIO5
+  rs485_tx: GPIO17
+  rs485_rx: GPIO16
+  rs485_de: GPIO13   # MAX485 DE/RE direction-control pin
+
+  # ── Vivarium Row A  (Juveniles, enclosures 1–8) ──────────────────────────
+  enc_01: "Row A - Enclosure 01"
+  enc_02: "Row A - Enclosure 02"
+  enc_03: "Row A - Enclosure 03"
+  enc_04: "Row A - Enclosure 04"
+  enc_05: "Row A - Enclosure 05"
+  enc_06: "Row A - Enclosure 06"
+  enc_07: "Row A - Enclosure 07"
+  enc_08: "Row A - Enclosure 08"
+
+  # ── Vivarium Row B  (Adults, enclosures 9–16) ────────────────────────────
+  enc_09: "Row B - Enclosure 09"
+  enc_10: "Row B - Enclosure 10"
+  enc_11: "Row B - Enclosure 11"
+  enc_12: "Row B - Enclosure 12"
+  enc_13: "Row B - Enclosure 13"
+  enc_14: "Row B - Enclosure 14"
+  enc_15: "Row B - Enclosure 15"
+  enc_16: "Row B - Enclosure 16"
+
 esphome:
-  name: project-template
-  friendly_name: Project Template
-  # Automatically add the mac address to the name
-  # so you can use a single firmware for all devices
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  # Automatically append MAC so one firmware can run on multiple boards
   name_add_mac_suffix: true
 
 esp32:
   board: esp32dev
   framework:
-    type: esp-idf
+    type: arduino   # arduino required for full Bluetooth proxy support
 
-# To be able to get logs from the device via serial and api.
+# Serial logging (uses UART0 on GPIO1/GPIO3 – separate from RS485 on UART2)
 logger:
 
-# API is a requirement of the dashboard import.
+# Home Assistant API
 api:
 
-# OTA is required for Over-the-Air updating
+# Over-the-Air updates
 ota:
   - platform: esphome
 
 wifi:
-  # Set up a wifi access point using the device name above
   ap:
 
-# In combination with the `ap` this allows the user
-# to provision wifi credentials to the device.
+# Captive portal for Wi-Fi provisioning
 captive_portal:
+
+# ── Bluetooth Proxy ──────────────────────────────────────────────────────────
+# Extends Home Assistant Bluetooth range into the vivarium room
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1100ms
+    window: 1100ms
+    active: true
+
+bluetooth_proxy:
+  active: true
+
+# ── I2C bus (PCF8575 GPIO expanders) ────────────────────────────────────────
+i2c:
+  sda: ${i2c_sda}
+  scl: ${i2c_scl}
+  scan: true
+
+# PCF8575 16-bit I2C GPIO expanders
+pcf8575:
+  - id: relay_expander   # Relay outputs 1-16  (verify address 0x24 for your board)
+    address: 0x24
+  - id: input_expander   # Digital inputs 1-16 (verify address 0x22 for your board)
+    address: 0x22
+
+# ── RS485 / Modbus (OI-7530) ─────────────────────────────────────────────────
+uart:
+  id: mod_bus
+  tx_pin: ${rs485_tx}
+  rx_pin: ${rs485_rx}
+  baud_rate: 9600
+  stop_bits: 1
+  parity: NONE
+
+modbus:
+  id: modbus1
+  uart_id: mod_bus
+  flow_control_pin: ${rs485_de}
+
+# OI-7530 32-channel gas detector – Modbus slave address 0x01
+# Register map: holding registers, FP32 (2 registers each)
+#   Ch 1  = 0x21 (33),  Ch 2  = 0x23 (35), …, Ch N = 0x21 + (N-1)*2
+modbus_controller:
+  - id: oi7530
+    address: 0x01
+    modbus_id: modbus1
+    setup_priority: -10
+    update_interval: 10s
+
+# ── Relay Switches (enclosure heating / lighting control) ────────────────────
+switch:
+  - platform: gpio
+    name: "${enc_01} Relay"
+    id: relay_01
+    pin: {pcf8575: relay_expander, number: 0,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_02} Relay"
+    id: relay_02
+    pin: {pcf8575: relay_expander, number: 1,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_03} Relay"
+    id: relay_03
+    pin: {pcf8575: relay_expander, number: 2,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_04} Relay"
+    id: relay_04
+    pin: {pcf8575: relay_expander, number: 3,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_05} Relay"
+    id: relay_05
+    pin: {pcf8575: relay_expander, number: 4,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_06} Relay"
+    id: relay_06
+    pin: {pcf8575: relay_expander, number: 5,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_07} Relay"
+    id: relay_07
+    pin: {pcf8575: relay_expander, number: 6,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_08} Relay"
+    id: relay_08
+    pin: {pcf8575: relay_expander, number: 7,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_09} Relay"
+    id: relay_09
+    pin: {pcf8575: relay_expander, number: 8,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_10} Relay"
+    id: relay_10
+    pin: {pcf8575: relay_expander, number: 9,  mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_11} Relay"
+    id: relay_11
+    pin: {pcf8575: relay_expander, number: 10, mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_12} Relay"
+    id: relay_12
+    pin: {pcf8575: relay_expander, number: 11, mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_13} Relay"
+    id: relay_13
+    pin: {pcf8575: relay_expander, number: 12, mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_14} Relay"
+    id: relay_14
+    pin: {pcf8575: relay_expander, number: 13, mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_15} Relay"
+    id: relay_15
+    pin: {pcf8575: relay_expander, number: 14, mode: {output: true}, inverted: false}
+  - platform: gpio
+    name: "${enc_16} Relay"
+    id: relay_16
+    pin: {pcf8575: relay_expander, number: 15, mode: {output: true}, inverted: false}
+
+# ── Binary Sensors (enclosure door / trigger inputs) ─────────────────────────
+binary_sensor:
+  - platform: status
+    name: "${friendly_name} Status"
+  - platform: gpio
+    name: "${enc_01} Input"
+    id: input_01
+    pin: {pcf8575: input_expander, number: 0,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_02} Input"
+    id: input_02
+    pin: {pcf8575: input_expander, number: 1,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_03} Input"
+    id: input_03
+    pin: {pcf8575: input_expander, number: 2,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_04} Input"
+    id: input_04
+    pin: {pcf8575: input_expander, number: 3,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_05} Input"
+    id: input_05
+    pin: {pcf8575: input_expander, number: 4,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_06} Input"
+    id: input_06
+    pin: {pcf8575: input_expander, number: 5,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_07} Input"
+    id: input_07
+    pin: {pcf8575: input_expander, number: 6,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_08} Input"
+    id: input_08
+    pin: {pcf8575: input_expander, number: 7,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_09} Input"
+    id: input_09
+    pin: {pcf8575: input_expander, number: 8,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_10} Input"
+    id: input_10
+    pin: {pcf8575: input_expander, number: 9,  mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_11} Input"
+    id: input_11
+    pin: {pcf8575: input_expander, number: 10, mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_12} Input"
+    id: input_12
+    pin: {pcf8575: input_expander, number: 11, mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_13} Input"
+    id: input_13
+    pin: {pcf8575: input_expander, number: 12, mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_14} Input"
+    id: input_14
+    pin: {pcf8575: input_expander, number: 13, mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_15} Input"
+    id: input_15
+    pin: {pcf8575: input_expander, number: 14, mode: {input: true}, inverted: true}
+  - platform: gpio
+    name: "${enc_16} Input"
+    id: input_16
+    pin: {pcf8575: input_expander, number: 15, mode: {input: true}, inverted: true}
+
+# ── Sensors (WiFi diagnostics + OI-7530 32-channel gas readings) ─────────────
+sensor:
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 60s
+
+  # OI-7530 gas channel readings
+  # Register addresses: Ch1=0x21, Ch2=0x23, …, ChN=0x21+(N-1)*2  (FP32 = 2 regs each)
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 01"
+    address: 0x21
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 02"
+    address: 0x23
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 03"
+    address: 0x25
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 04"
+    address: 0x27
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 05"
+    address: 0x29
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 06"
+    address: 0x2B
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 07"
+    address: 0x2D
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 08"
+    address: 0x2F
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 09"
+    address: 0x31
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 10"
+    address: 0x33
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 11"
+    address: 0x35
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 12"
+    address: 0x37
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 13"
+    address: 0x39
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 14"
+    address: 0x3B
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 15"
+    address: 0x3D
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 16"
+    address: 0x3F
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 17"
+    address: 0x41
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 18"
+    address: 0x43
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 19"
+    address: 0x45
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 20"
+    address: 0x47
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 21"
+    address: 0x49
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 22"
+    address: 0x4B
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 23"
+    address: 0x4D
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 24"
+    address: 0x4F
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 25"
+    address: 0x51
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 26"
+    address: 0x53
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 27"
+    address: 0x55
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 28"
+    address: 0x57
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 29"
+    address: 0x59
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 30"
+    address: 0x5B
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 31"
+    address: 0x5D
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+  - platform: modbus_controller
+    modbus_controller_id: oi7530
+    name: "${friendly_name} OI7530 Ch 32"
+    address: 0x5F
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "ppm"
+    device_class: gas
+    accuracy_decimals: 2
+
+# ── Text Sensors ──────────────────────────────────────────────────────────────
+# NFC / QR-code identification
+# Each enclosure URL can be encoded as a QR code or written to an NFC tag (e.g. NTAG213).
+# Place a printed QR code or NFC sticker on each enclosure for instant dashboard access.
+# Optional: attach a PN532 NFC reader via I2C (addr 0x28) and add the nfc: component
+#           to enable automated tag-detection automations in Home Assistant.
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP Address"
+    ssid:
+      name: "${friendly_name} SSID"
+
+  - platform: template
+    name: "${enc_01} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/01");
+  - platform: template
+    name: "${enc_02} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/02");
+  - platform: template
+    name: "${enc_03} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/03");
+  - platform: template
+    name: "${enc_04} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/04");
+  - platform: template
+    name: "${enc_05} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/05");
+  - platform: template
+    name: "${enc_06} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/06");
+  - platform: template
+    name: "${enc_07} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/07");
+  - platform: template
+    name: "${enc_08} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/08");
+  - platform: template
+    name: "${enc_09} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/09");
+  - platform: template
+    name: "${enc_10} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/10");
+  - platform: template
+    name: "${enc_11} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/11");
+  - platform: template
+    name: "${enc_12} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/12");
+  - platform: template
+    name: "${enc_13} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/13");
+  - platform: template
+    name: "${enc_14} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/14");
+  - platform: template
+    name: "${enc_15} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/15");
+  - platform: template
+    name: "${enc_16} QR Tag"
+    update_interval: never
+    lambda: return std::string("http://${device_name}.local/enc/16");
+
+# ── Buttons ───────────────────────────────────────────────────────────────────
+button:
+  - platform: restart
+    name: "${friendly_name} Restart"
