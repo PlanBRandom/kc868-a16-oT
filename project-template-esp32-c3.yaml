@@ -27,3 +27,55 @@ wifi:
 # In combination with the `ap` this allows the user
 # to provision wifi credentials to the device.
 captive_portal:
+
+# SNTP time sync required for accurate telemetry timestamps.
+time:
+  - platform: sntp
+    id: sntp_time
+
+# Telemetry: device uptime and WiFi signal strength.
+sensor:
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+  - platform: wifi_signal
+    name: WiFi Signal
+    update_interval: 60s
+    entity_category: diagnostic
+
+# Telemetry: network and device identity info.
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+      entity_category: diagnostic
+    ssid:
+      name: Connected SSID
+      entity_category: diagnostic
+    mac_address:
+      name: MAC Address
+      entity_category: diagnostic
+  - platform: version
+    name: ESPHome Version
+    entity_category: diagnostic
+
+# Expose Prometheus metrics endpoint for stats and analytics dashboards.
+# NOTE: Restrict access to this endpoint at the network level (firewall /
+# VLAN) because ESPHome's prometheus component has no built-in auth.
+prometheus:
+
+# InfluxDB integration for persistent telemetry database storage.
+# Add the following entries to your secrets.yaml:
+#   influxdb_host: "192.168.1.x"   # InfluxDB server IP or hostname
+#   influxdb_port: 8086            # default InfluxDB HTTP port (numeric)
+#   influxdb_database: "esphome"   # target database name
+#   influxdb_username: "esphome"   # InfluxDB username (required; set to "" if unused)
+#   influxdb_password: "changeme"  # InfluxDB password (required; set to "" if unused)
+influxdb:
+  host: !secret influxdb_host
+  port: !secret influxdb_port
+  database: !secret influxdb_database
+  username: !secret influxdb_username
+  password: !secret influxdb_password
+  tags:
+    device: ${name}
