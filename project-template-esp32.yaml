@@ -31,7 +31,6 @@ captive_portal:
 # SNTP time sync required for accurate telemetry timestamps.
 time:
   - platform: sntp
-    id: sntp_time
 
 # Telemetry: device uptime and WiFi signal strength.
 sensor:
