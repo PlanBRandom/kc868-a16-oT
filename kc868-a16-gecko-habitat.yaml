@@ -1,0 +1,1230 @@
+################################################################################
+# Crested Gecko Habitat Control Center
+# Hardware: KC868-A16 (ESP32) + 8-ch Solid-State Relay Module
+#
+# Features:
+#  - 30× DS18B20 one-wire temperature sensors
+#  - SHT30/SHT31 humidity sensors (I2C)
+#  - Capacitive substrate moisture sensors (analog ADC)
+#  - Analog UV index sensors (ADC)
+#  - 8-ch SSR + KC868-A16 relays (heating, misting, UVB, ambient light,
+#    night heat, fan power, alarm buzzer)
+#  - Fan PWM speed control
+#  - Alarm indicator LEDs (Red / Yellow / Green)
+#  - Physical buttons: Feed logged, Manual mist, Alarm dismiss
+#  - Countdown timers for feeding & misting with auto-alarm / auto-mist
+#  - Day/Night lighting schedule via Home Assistant time
+#  - Adjustable setpoints exposed to Home Assistant
+#  - XBee S3B 900 MHz DigiMesh coordinator via UART
+#  - Publishes feed/mist events back to Home Assistant
+#
+# KC868-A16 Pin Reference:
+#  I2C  : SDA=GPIO4, SCL=GPIO15
+#  1-Wire: GPIO21  (free GPIO – tie all DS18B20 data lines here)
+#  Relay expanders: PCF8574 @ 0x24 (relays 1-8), 0x25 (relays 9-16)
+#  Analog inputs  : GPIO36, GPIO39, GPIO34, GPIO35 (input-only ADC1)
+#                   GPIO32, GPIO33 (ADC1, also output-capable)
+#  Digital inputs : GPIO12, GPIO13, GPIO14, GPIO27 (opto-isolated)
+#  Fan PWM        : GPIO26
+#  Alarm LEDs     : GPIO25 (red), GPIO18 (yellow), GPIO19 (green)
+#  XBee UART      : TX=GPIO17, RX=GPIO16
+################################################################################
+
+esphome:
+  name: gecko-habitat
+  friendly_name: Crested Gecko Habitat Control Center
+  name_add_mac_suffix: false
+  on_boot:
+    priority: 600
+    then:
+      - script.execute: boot_status_blink
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Gecko Habitat Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+# Local web dashboard (accessible at http://<device-ip>)
+web_server:
+  port: 80
+
+################################################################################
+# TIME  – used for scheduling day/night cycle and countdown ticks
+################################################################################
+time:
+  - platform: homeassistant
+    id: ha_time
+    # Adjust to your local timezone
+    timezone: America/New_York
+    on_time:
+      # Tick countdown timers every 60 seconds
+      - seconds: 0
+        minutes: /1
+        then:
+          - script.execute: tick_countdowns
+      # Morning lights ON at 07:00
+      - seconds: 0
+        minutes: 0
+        hours: 7
+        then:
+          - switch.turn_on: relay_uvb
+          - switch.turn_on: relay_ambient_light
+          - logger.log: "Day cycle started – lights on"
+      # Evening lights OFF at 21:00
+      - seconds: 0
+        minutes: 0
+        hours: 21
+        then:
+          - switch.turn_off: relay_uvb
+          - switch.turn_off: relay_ambient_light
+          - switch.turn_on: relay_night_heat
+          - logger.log: "Night cycle started – lights off, night heat on"
+      # Night heat off at 07:00 (already handled by morning on)
+      - seconds: 0
+        minutes: 0
+        hours: 7
+        then:
+          - switch.turn_off: relay_night_heat
+
+################################################################################
+# I2C BUS  (PCF8574 relay expanders + SHT30 humidity sensors)
+################################################################################
+i2c:
+  - id: bus_a
+    sda: GPIO4
+    scl: GPIO15
+    scan: true
+    frequency: 100khz
+
+################################################################################
+# 1-WIRE BUS  (30× DS18B20 temperature sensors)
+# Connect all sensor data lines to GPIO21 with a 4.7kΩ pull-up to 3.3V.
+# Run  `esphome logs kc868-a16-gecko-habitat.yaml`  to discover each sensor address,
+# then replace the placeholder addresses below.
+################################################################################
+one_wire:
+  - platform: gpio
+    pin: GPIO21
+    id: ow_bus
+
+################################################################################
+# UART  (XBee S3B DigiMesh 900 MHz coordinator module)
+# Connect XBee DOUT→GPIO16, DIN→GPIO17.  The XBee should be configured as
+# coordinator in DigiMesh API mode (AP=1).  Remote nodes can be any ESP32 or
+# Arduino + XBee talking AT/API frames over serial.
+################################################################################
+uart:
+  - id: xbee_uart
+    tx_pin: GPIO17
+    rx_pin: GPIO16
+    baud_rate: 9600
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+
+################################################################################
+# PCF8574 I/O EXPANDERS  (KC868-A16 relay banks)
+################################################################################
+pcf8574:
+  - id: relay_bank_1
+    address: 0x24
+    pcf8575: false
+  - id: relay_bank_2
+    address: 0x25
+    pcf8575: false
+
+################################################################################
+# GLOBAL VARIABLES
+################################################################################
+globals:
+  # Countdown timers (seconds remaining)
+  - id: feeding_countdown
+    type: int
+    restore_value: true
+    initial_value: '43200'   # 12 hours default
+
+  - id: misting_countdown
+    type: int
+    restore_value: true
+    initial_value: '7200'    # 2 hours default
+
+  # Cumulative counts (reset at midnight via HA automation)
+  - id: feed_count_today
+    type: int
+    restore_value: true
+    initial_value: '0'
+
+  - id: mist_count_today
+    type: int
+    restore_value: true
+    initial_value: '0'
+
+  # Alarm state
+  - id: alarm_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # Temperature setpoints (°C)
+  - id: g_target_warm
+    type: float
+    restore_value: true
+    initial_value: '27.0'
+
+  - id: g_target_cool
+    type: float
+    restore_value: true
+    initial_value: '22.0'
+
+  # Humidity setpoints (%)
+  - id: g_humidity_min
+    type: float
+    restore_value: true
+    initial_value: '60.0'
+
+  - id: g_humidity_max
+    type: float
+    restore_value: true
+    initial_value: '80.0'
+
+################################################################################
+# OUTPUTS
+################################################################################
+output:
+  # Fan PWM speed (25 kHz – suits most 4-wire PC-type fans)
+  - platform: ledc
+    pin: GPIO26
+    id: fan_pwm_output
+    frequency: 25000Hz
+
+  # Alarm LED outputs (simple GPIO LEDs)
+  - platform: gpio
+    pin: GPIO25
+    id: alarm_led_red_output
+
+  - platform: gpio
+    pin: GPIO18
+    id: alarm_led_yellow_output
+
+  - platform: gpio
+    pin: GPIO19
+    id: alarm_led_green_output
+
+################################################################################
+# FAN
+################################################################################
+fan:
+  - platform: speed
+    output: fan_pwm_output
+    name: "Enclosure Ventilation Fan"
+    id: enclosure_fan
+    icon: "mdi:fan"
+
+################################################################################
+# LIGHTS  (Alarm & Status indicator LEDs)
+################################################################################
+light:
+  - platform: binary
+    name: "Alarm LED Red"
+    id: alarm_led_red
+    output: alarm_led_red_output
+    icon: "mdi:alarm-light"
+
+  - platform: binary
+    name: "Alarm LED Yellow"
+    id: alarm_led_yellow
+    output: alarm_led_yellow_output
+    icon: "mdi:alarm-light"
+
+  - platform: binary
+    name: "Status LED Green"
+    id: status_led_green
+    output: alarm_led_green_output
+    icon: "mdi:led-on"
+
+################################################################################
+# SWITCHES  (Relay outputs)
+#
+# Relays 1-8  → 8-channel Solid-State Relay (SSR) module controlling
+#               high-voltage/high-current loads.
+# Relays 9-16 → Additional KC868-A16 relay channels for low-voltage loads.
+################################################################################
+switch:
+  # ── Relay 1: Heating Zone 1 (warm side ceramic heat emitter / mat) ──────
+  - platform: gpio
+    id: relay_heating_1
+    name: "Heating Zone 1"
+    icon: "mdi:radiator"
+    pin:
+      pcf8574: relay_bank_1
+      number: 0
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relay 2: Heating Zone 2 (cool side supplemental heat) ───────────────
+  - platform: gpio
+    id: relay_heating_2
+    name: "Heating Zone 2"
+    icon: "mdi:radiator"
+    pin:
+      pcf8574: relay_bank_1
+      number: 1
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relay 3: Primary Misting Pump (auto-off after 30 s) ─────────────────
+  - platform: gpio
+    id: relay_misting
+    name: "Misting Pump"
+    icon: "mdi:water-pump"
+    pin:
+      pcf8574: relay_bank_1
+      number: 2
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - delay: !lambda "return (uint32_t)(id(sp_mist_duration).state * 1000);"
+      - switch.turn_off: relay_misting
+
+  # ── Relay 4: UVB Lamp ───────────────────────────────────────────────────
+  - platform: gpio
+    id: relay_uvb
+    name: "UVB Lamp"
+    icon: "mdi:weather-sunny"
+    pin:
+      pcf8574: relay_bank_1
+      number: 3
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relay 5: Ambient / White LED Lighting ───────────────────────────────
+  - platform: gpio
+    id: relay_ambient_light
+    name: "Ambient Lighting"
+    icon: "mdi:ceiling-light"
+    pin:
+      pcf8574: relay_bank_1
+      number: 4
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relay 6: Ventilation Fan (relay on/off; speed via PWM above) ─────────
+  - platform: gpio
+    id: relay_fan_power
+    name: "Fan Power Relay"
+    icon: "mdi:fan"
+    pin:
+      pcf8574: relay_bank_1
+      number: 5
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # ── Relay 7: Night Heat Lamp (red basking / ceramic, no light emitted) ───
+  - platform: gpio
+    id: relay_night_heat
+    name: "Night Heat Lamp"
+    icon: "mdi:weather-night"
+    pin:
+      pcf8574: relay_bank_1
+      number: 6
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relay 8: Alarm Buzzer / Siren ────────────────────────────────────────
+  - platform: gpio
+    id: relay_alarm_buzzer
+    name: "Alarm Buzzer"
+    icon: "mdi:alarm-bell"
+    pin:
+      pcf8574: relay_bank_1
+      number: 7
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relay 9: Backup Misting Pump (auto-off after 20 s) ──────────────────
+  - platform: gpio
+    id: relay_backup_misting
+    name: "Backup Misting Pump"
+    icon: "mdi:water"
+    pin:
+      pcf8574: relay_bank_2
+      number: 0
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - delay: !lambda "return (uint32_t)(id(sp_mist_duration).state * 1000);"
+      - switch.turn_off: relay_backup_misting
+
+  # ── Relay 10: Secondary Lighting Zone ────────────────────────────────────
+  - platform: gpio
+    id: relay_secondary_light
+    name: "Secondary Lighting Zone"
+    icon: "mdi:lightbulb"
+    pin:
+      pcf8574: relay_bank_2
+      number: 1
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relay 11: Heating Zone 3 (spare / third enclosure) ──────────────────
+  - platform: gpio
+    id: relay_heating_3
+    name: "Heating Zone 3"
+    icon: "mdi:radiator"
+    pin:
+      pcf8574: relay_bank_2
+      number: 2
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relay 12: Heating Zone 4 (spare) ─────────────────────────────────────
+  - platform: gpio
+    id: relay_heating_4
+    name: "Heating Zone 4"
+    icon: "mdi:radiator"
+    pin:
+      pcf8574: relay_bank_2
+      number: 3
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # ── Relays 13-16: Spare auxiliary channels ───────────────────────────────
+  - platform: gpio
+    id: relay_aux_13
+    name: "Auxiliary Relay 13"
+    pin:
+      pcf8574: relay_bank_2
+      number: 4
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: gpio
+    id: relay_aux_14
+    name: "Auxiliary Relay 14"
+    pin:
+      pcf8574: relay_bank_2
+      number: 5
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: gpio
+    id: relay_aux_15
+    name: "Auxiliary Relay 15"
+    pin:
+      pcf8574: relay_bank_2
+      number: 6
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: gpio
+    id: relay_aux_16
+    name: "Auxiliary Relay 16"
+    pin:
+      pcf8574: relay_bank_2
+      number: 7
+      mode:
+        output: true
+      inverted: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+################################################################################
+# BINARY SENSORS  (Physical buttons & door sensor)
+# KC868-A16 digital inputs are opto-isolated with internal pull-ups.
+################################################################################
+binary_sensor:
+  # ── Feed Button (press = feeding occurred, resets countdown) ─────────────
+  - platform: gpio
+    pin:
+      number: GPIO12
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Feed Button"
+    id: feed_button
+    icon: "mdi:food"
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - script.execute: log_feeding
+
+  # ── Manual Mist Button (press = misting now, resets countdown) ───────────
+  - platform: gpio
+    pin:
+      number: GPIO13
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Manual Mist Button"
+    id: mist_button
+    icon: "mdi:water-pump"
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - switch.turn_on: relay_misting
+      - script.execute: log_misting
+
+  # ── Alarm Dismiss Button ─────────────────────────────────────────────────
+  - platform: gpio
+    pin:
+      number: GPIO14
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Alarm Dismiss Button"
+    id: dismiss_button
+    icon: "mdi:alarm-off"
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - script.execute: dismiss_alarm
+
+  # ── Enclosure Door / Access Panel ────────────────────────────────────────
+  - platform: gpio
+    pin:
+      number: GPIO27
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Enclosure Door Open"
+    id: door_sensor
+    icon: "mdi:door-open"
+    filters:
+      - delayed_on: 100ms
+    on_press:
+      - light.turn_on: alarm_led_yellow
+      - logger.log: "Enclosure door opened"
+    on_release:
+      - light.turn_off: alarm_led_yellow
+      - logger.log: "Enclosure door closed"
+
+################################################################################
+# SENSORS
+################################################################################
+sensor:
+  # ── DS18B20 Temperature Sensors (1-Wire) ─────────────────────────────────
+  # Run `esphome logs kc868-a16-gecko-habitat.yaml` while sensors are connected
+  # to discover the 8-byte unique address of each sensor, then replace the
+  # placeholder values below with the real addresses.
+  # DS18B20 addresses always start with family code 0x28 (format: 0x28XXXXXXXXXXXX**).
+  # Group naming convention: Enc<N> = enclosure N, WS = warm side,
+  # CS = cool side, AMB = ambient room.
+
+  - platform: dallas_temp
+    address: 0x28AA000000010001  # Replace with actual address from bus scan
+    name: "Enclosure 1 Warm Side Temp"
+    id: temp_enc1_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000020001
+    name: "Enclosure 1 Cool Side Temp"
+    id: temp_enc1_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000030001
+    name: "Enclosure 2 Warm Side Temp"
+    id: temp_enc2_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000040001
+    name: "Enclosure 2 Cool Side Temp"
+    id: temp_enc2_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000050001
+    name: "Enclosure 3 Warm Side Temp"
+    id: temp_enc3_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000060001
+    name: "Enclosure 3 Cool Side Temp"
+    id: temp_enc3_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000070001
+    name: "Enclosure 4 Warm Side Temp"
+    id: temp_enc4_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000080001
+    name: "Enclosure 4 Cool Side Temp"
+    id: temp_enc4_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000090001
+    name: "Enclosure 5 Warm Side Temp"
+    id: temp_enc5_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000000A0001
+    name: "Enclosure 5 Cool Side Temp"
+    id: temp_enc5_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000000B0001
+    name: "Enclosure 6 Warm Side Temp"
+    id: temp_enc6_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000000C0001
+    name: "Enclosure 6 Cool Side Temp"
+    id: temp_enc6_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000000D0001
+    name: "Enclosure 7 Warm Side Temp"
+    id: temp_enc7_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000000E0001
+    name: "Enclosure 7 Cool Side Temp"
+    id: temp_enc7_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000000F0001
+    name: "Enclosure 8 Warm Side Temp"
+    id: temp_enc8_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000100001
+    name: "Enclosure 8 Cool Side Temp"
+    id: temp_enc8_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000110001
+    name: "Enclosure 9 Warm Side Temp"
+    id: temp_enc9_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000120001
+    name: "Enclosure 9 Cool Side Temp"
+    id: temp_enc9_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000130001
+    name: "Enclosure 10 Warm Side Temp"
+    id: temp_enc10_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000140001
+    name: "Enclosure 10 Cool Side Temp"
+    id: temp_enc10_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000150001
+    name: "Enclosure 11 Warm Side Temp"
+    id: temp_enc11_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000160001
+    name: "Enclosure 11 Cool Side Temp"
+    id: temp_enc11_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000170001
+    name: "Enclosure 12 Warm Side Temp"
+    id: temp_enc12_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000180001
+    name: "Enclosure 12 Cool Side Temp"
+    id: temp_enc12_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA000000190001
+    name: "Enclosure 13 Warm Side Temp"
+    id: temp_enc13_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000001A0001
+    name: "Enclosure 13 Cool Side Temp"
+    id: temp_enc13_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000001B0001
+    name: "Enclosure 14 Warm Side Temp"
+    id: temp_enc14_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000001C0001
+    name: "Enclosure 14 Cool Side Temp"
+    id: temp_enc14_cool
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000001D0001
+    name: "Enclosure 15 Warm Side Temp"
+    id: temp_enc15_warm
+    filters: [filter_out: nan]
+
+  - platform: dallas_temp
+    address: 0x28AA0000001E0001
+    name: "Enclosure 15 Cool Side Temp"
+    id: temp_enc15_cool
+    filters: [filter_out: nan]
+
+  # ── SHT30/SHT31 Humidity + Temperature Sensors (I2C) ─────────────────────
+  # Up to two SHT3x sensors can share I2C: 0x44 (ADDR pin low) and
+  # 0x45 (ADDR pin high).  Add more via an I2C multiplexer (TCA9548A).
+  - platform: sht3xd
+    address: 0x44
+    update_interval: 60s
+    temperature:
+      name: "SHT30 #1 Temperature"
+      id: sht1_temp
+    humidity:
+      name: "Humidity Zone 1"
+      id: humidity_zone1
+      on_value:
+        then:
+          - script.execute: check_humidity
+
+  - platform: sht3xd
+    address: 0x45
+    update_interval: 60s
+    temperature:
+      name: "SHT30 #2 Temperature"
+      id: sht2_temp
+    humidity:
+      name: "Humidity Zone 2"
+      id: humidity_zone2
+      on_value:
+        then:
+          - script.execute: check_humidity
+
+  # ── Analog UV Index Sensors ───────────────────────────────────────────────
+  # Typical UV sensors (e.g. GUVA-S12SD, ML8511) output 0–1 V on ESP32 ADC.
+  # Calibrate multiply factor for your specific sensor's V→UV index curve.
+  - platform: adc
+    pin: GPIO36
+    name: "UV Index Sensor 1"
+    id: uv_sensor_1
+    unit_of_measurement: "V"
+    icon: "mdi:sun-wireless"
+    attenuation: auto
+    update_interval: 30s
+    filters:
+      - multiply: 3.3
+
+  - platform: adc
+    pin: GPIO39
+    name: "UV Index Sensor 2"
+    id: uv_sensor_2
+    unit_of_measurement: "V"
+    icon: "mdi:sun-wireless"
+    attenuation: auto
+    update_interval: 30s
+    filters:
+      - multiply: 3.3
+
+  # ── Capacitive Soil / Substrate Moisture Sensors ──────────────────────────
+  # Calibrate dry_voltage and wet_voltage for your specific sensors by
+  # reading the raw voltage with the sensor in dry soil vs. saturated soil.
+  - platform: adc
+    pin: GPIO34
+    name: "Substrate Moisture Zone 1"
+    id: moisture_zone1
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    attenuation: auto
+    update_interval: 60s
+    filters:
+      - lambda: |-
+          const float dry_v = 2.8f;
+          const float wet_v = 1.2f;
+          float pct = (dry_v - x) / (dry_v - wet_v) * 100.0f;
+          if (pct < 0.0f) pct = 0.0f;
+          if (pct > 100.0f) pct = 100.0f;
+          return pct;
+
+  - platform: adc
+    pin: GPIO35
+    name: "Substrate Moisture Zone 2"
+    id: moisture_zone2
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    attenuation: auto
+    update_interval: 60s
+    filters:
+      - lambda: |-
+          const float dry_v = 2.8f;
+          const float wet_v = 1.2f;
+          float pct = (dry_v - x) / (dry_v - wet_v) * 100.0f;
+          if (pct < 0.0f) pct = 0.0f;
+          if (pct > 100.0f) pct = 100.0f;
+          return pct;
+
+  # ── Countdown Timer Sensors (exposed to Home Assistant) ──────────────────
+  - platform: template
+    name: "Next Feeding In"
+    id: feeding_countdown_sensor
+    unit_of_measurement: "s"
+    icon: "mdi:timer"
+    state_class: measurement
+    lambda: "return id(feeding_countdown);"
+    update_interval: 10s
+
+  - platform: template
+    name: "Next Misting In"
+    id: misting_countdown_sensor
+    unit_of_measurement: "s"
+    icon: "mdi:timer-sand"
+    state_class: measurement
+    lambda: "return id(misting_countdown);"
+    update_interval: 10s
+
+  # ── Daily counters ────────────────────────────────────────────────────────
+  - platform: template
+    name: "Feeds Today"
+    id: feeds_today_sensor
+    icon: "mdi:counter"
+    state_class: total_increasing
+    lambda: "return id(feed_count_today);"
+    update_interval: 30s
+
+  - platform: template
+    name: "Mists Today"
+    id: mists_today_sensor
+    icon: "mdi:counter"
+    state_class: total_increasing
+    lambda: "return id(mist_count_today);"
+    update_interval: 30s
+
+  # ── System diagnostics ────────────────────────────────────────────────────
+  - platform: wifi_signal
+    name: "WiFi Signal Strength"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "System Uptime"
+    update_interval: 60s
+
+################################################################################
+# TEXT SENSORS  (Human-readable status strings shown in HA)
+################################################################################
+text_sensor:
+  - platform: template
+    name: "Feeding Status"
+    id: feeding_status_text
+    icon: "mdi:food-drumstick"
+    update_interval: 30s
+    lambda: |-
+      int s = id(feeding_countdown);
+      if (s <= 0) return std::string("⚠ FEED NOW!");
+      int h = s / 3600;
+      int m = (s % 3600) / 60;
+      char buf[32];
+      snprintf(buf, sizeof(buf), "Feed in %02dh %02dm", h, m);
+      return std::string(buf);
+
+  - platform: template
+    name: "Misting Status"
+    id: misting_status_text
+    icon: "mdi:water-pump"
+    update_interval: 30s
+    lambda: |-
+      int s = id(misting_countdown);
+      if (s <= 0) return std::string("⚠ MIST NOW!");
+      int h = s / 3600;
+      int m = (s % 3600) / 60;
+      char buf[32];
+      snprintf(buf, sizeof(buf), "Mist in %02dh %02dm", h, m);
+      return std::string(buf);
+
+  - platform: template
+    name: "System Status"
+    id: system_status_text
+    icon: "mdi:information"
+    update_interval: 10s
+    lambda: |-
+      if (id(alarm_active)) return std::string("⚠ ALARM ACTIVE");
+      return std::string("✓ Normal");
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    ssid:
+      name: "Connected SSID"
+    mac_address:
+      name: "MAC Address"
+
+  - platform: version
+    name: "ESPHome Version"
+
+################################################################################
+# NUMBER  (Adjustable setpoints exposed to Home Assistant)
+################################################################################
+number:
+  - platform: template
+    name: "Target Warm Side Temp"
+    id: sp_warm_temp
+    min_value: 20.0
+    max_value: 33.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer-high"
+    optimistic: true
+    restore_value: true
+    initial_value: 27.0
+    on_value:
+      - globals.set:
+          id: g_target_warm
+          value: !lambda "return x;"
+
+  - platform: template
+    name: "Target Cool Side Temp"
+    id: sp_cool_temp
+    min_value: 18.0
+    max_value: 26.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer-low"
+    optimistic: true
+    restore_value: true
+    initial_value: 22.0
+    on_value:
+      - globals.set:
+          id: g_target_cool
+          value: !lambda "return x;"
+
+  - platform: template
+    name: "Humidity Minimum"
+    id: sp_humidity_min
+    min_value: 40.0
+    max_value: 70.0
+    step: 1.0
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    optimistic: true
+    restore_value: true
+    initial_value: 60.0
+    on_value:
+      - globals.set:
+          id: g_humidity_min
+          value: !lambda "return x;"
+
+  - platform: template
+    name: "Humidity Maximum"
+    id: sp_humidity_max
+    min_value: 60.0
+    max_value: 90.0
+    step: 1.0
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    optimistic: true
+    restore_value: true
+    initial_value: 80.0
+    on_value:
+      - globals.set:
+          id: g_humidity_max
+          value: !lambda "return x;"
+
+  - platform: template
+    name: "Feeding Interval"
+    id: sp_feed_interval
+    min_value: 4.0
+    max_value: 72.0
+    step: 1.0
+    unit_of_measurement: "h"
+    icon: "mdi:food"
+    optimistic: true
+    restore_value: true
+    initial_value: 12.0
+
+  - platform: template
+    name: "Misting Interval"
+    id: sp_mist_interval
+    min_value: 0.5
+    max_value: 12.0
+    step: 0.5
+    unit_of_measurement: "h"
+    icon: "mdi:water-pump"
+    optimistic: true
+    restore_value: true
+    initial_value: 2.0
+
+  - platform: template
+    name: "Misting Duration"
+    id: sp_mist_duration
+    min_value: 5.0
+    max_value: 120.0
+    step: 5.0
+    unit_of_measurement: "s"
+    icon: "mdi:timer"
+    optimistic: true
+    restore_value: true
+    initial_value: 30.0
+
+################################################################################
+# SCRIPTS
+################################################################################
+script:
+  # ── Boot blink: green LED flashes 3 times to confirm startup ─────────────
+  - id: boot_status_blink
+    then:
+      - repeat:
+          count: 3
+          then:
+            - light.turn_on: status_led_green
+            - delay: 300ms
+            - light.turn_off: status_led_green
+            - delay: 300ms
+      - light.turn_on: status_led_green
+
+  # ── Tick countdown timers (called every 60 s by time component) ──────────
+  - id: tick_countdowns
+    then:
+      - globals.set:
+          id: feeding_countdown
+          value: !lambda |-
+            int v = id(feeding_countdown) - 60;
+            return v < 0 ? 0 : v;
+      - globals.set:
+          id: misting_countdown
+          value: !lambda |-
+            int v = id(misting_countdown) - 60;
+            return v < 0 ? 0 : v;
+      # Trigger overdue actions
+      - if:
+          condition:
+            lambda: "return id(feeding_countdown) == 0;"
+          then:
+            - script.execute: alarm_feed_overdue
+      - if:
+          condition:
+            lambda: "return id(misting_countdown) == 0;"
+          then:
+            - script.execute: auto_mist
+      # Run temperature control check every minute
+      - script.execute: check_temperature
+
+  # ── Log a feeding event and reset the countdown ───────────────────────────
+  - id: log_feeding
+    then:
+      - globals.set:
+          id: feeding_countdown
+          value: !lambda |-
+            return (int)(id(sp_feed_interval).state * 3600.0f);
+      - globals.set:
+          id: feed_count_today
+          value: !lambda "return id(feed_count_today) + 1;"
+      - globals.set:
+          id: alarm_active
+          value: "false"
+      - light.turn_off: alarm_led_red
+      - switch.turn_off: relay_alarm_buzzer
+      # Green flash confirmation
+      - light.turn_off: status_led_green
+      - delay: 100ms
+      - light.turn_on: status_led_green
+      - delay: 1s
+      - light.turn_off: status_led_green
+      - delay: 200ms
+      - light.turn_on: status_led_green
+      - logger.log: "✓ Feeding logged"
+      - homeassistant.event:
+          event: esphome.gecko_fed
+          data:
+            count: !lambda "return std::to_string(id(feed_count_today));"
+
+  # ── Log a misting event and reset the countdown ───────────────────────────
+  - id: log_misting
+    then:
+      - globals.set:
+          id: misting_countdown
+          value: !lambda |-
+            return (int)(id(sp_mist_interval).state * 3600.0f);
+      - globals.set:
+          id: mist_count_today
+          value: !lambda "return id(mist_count_today) + 1;"
+      - logger.log: "✓ Misting logged"
+      - homeassistant.event:
+          event: esphome.gecko_misted
+          data:
+            count: !lambda "return std::to_string(id(mist_count_today));"
+
+  # ── Automatically trigger misting pump and log it ─────────────────────────
+  - id: auto_mist
+    then:
+      - logger.log: "Auto-misting triggered"
+      - switch.turn_on: relay_misting
+      - script.execute: log_misting
+
+  # ── Feeding overdue alarm ─────────────────────────────────────────────────
+  - id: alarm_feed_overdue
+    then:
+      - globals.set:
+          id: alarm_active
+          value: "true"
+      - light.turn_on: alarm_led_red
+      - switch.turn_on: relay_alarm_buzzer
+      - delay: 3s
+      - switch.turn_off: relay_alarm_buzzer
+      - logger.log: "⚠ ALARM: Feeding overdue!"
+      - homeassistant.event:
+          event: esphome.gecko_alarm
+          data:
+            reason: "feeding_overdue"
+
+  # ── Dismiss alarm (button press or HA call) ───────────────────────────────
+  - id: dismiss_alarm
+    then:
+      - globals.set:
+          id: alarm_active
+          value: "false"
+      - light.turn_off: alarm_led_red
+      - switch.turn_off: relay_alarm_buzzer
+      - logger.log: "Alarm dismissed"
+
+  # ── Humidity control: mist if too dry, boost fan if too humid ────────────
+  - id: check_humidity
+    then:
+      - if:
+          condition:
+            lambda: |-
+              float h = id(humidity_zone1).state;
+              return !isnan(h) && h < id(g_humidity_min);
+          then:
+            - logger.log: "Low humidity – auto-misting"
+            - switch.turn_on: relay_misting
+            - script.execute: log_misting
+      - if:
+          condition:
+            lambda: |-
+              float h = id(humidity_zone1).state;
+              return !isnan(h) && h > id(g_humidity_max);
+          then:
+            - logger.log: "High humidity – boosting ventilation"
+            - fan.turn_on:
+                id: enclosure_fan
+                speed: 100
+
+  # ── Temperature control: thermostat logic for warm & cool zones ───────────
+  - id: check_temperature
+    then:
+      # Warm side: turn heating on if below setpoint, off if above
+      - if:
+          condition:
+            lambda: |-
+              float t = id(temp_enc1_warm).state;
+              return !isnan(t) && t < id(g_target_warm) - 1.0f;
+          then:
+            - switch.turn_on: relay_heating_1
+      - if:
+          condition:
+            lambda: |-
+              float t = id(temp_enc1_warm).state;
+              return !isnan(t) && t > id(g_target_warm) + 1.0f;
+          then:
+            - switch.turn_off: relay_heating_1
+      # Cool side / ambient
+      - if:
+          condition:
+            lambda: |-
+              float t = id(temp_enc1_cool).state;
+              return !isnan(t) && t < id(g_target_cool) - 1.0f;
+          then:
+            - switch.turn_on: relay_heating_2
+      - if:
+          condition:
+            lambda: |-
+              float t = id(temp_enc1_cool).state;
+              return !isnan(t) && t > id(g_target_cool) + 1.0f;
+          then:
+            - switch.turn_off: relay_heating_2
+      # High-temp alarm (runaway heat)
+      - if:
+          condition:
+            lambda: |-
+              float t = id(temp_enc1_warm).state;
+              return !isnan(t) && t > id(g_target_warm) + 4.0f;
+          then:
+            - light.turn_on: alarm_led_red
+            - switch.turn_on: relay_alarm_buzzer
+            - delay: 2s
+            - switch.turn_off: relay_alarm_buzzer
+            - logger.log: "⚠ ALARM: Warm side overtemperature!"
+            - homeassistant.event:
+                event: esphome.gecko_alarm
+                data:
+                  reason: "overtemperature"
